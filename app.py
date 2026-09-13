@@ -8,11 +8,11 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from ai_service import AIError, NutritionAI
-from exports import export_csv, export_document, export_pdf
+from exports import export_csv, export_document, export_pdf, export_text
 from nutrition import (
     ACTIVITY, ALLERGENS, ALLERGY_NOTICE, CONDITIONS, DIETS, DISCLAIMER, GOALS,
     MEALS, RESTRICTIONS, SCREENING, ValidationError, assess_safety,
-    calculate_nutrition, replace_meal, validate_profile,
+    build_guidance_report, calculate_nutrition, profile_errors, replace_meal, validate_profile,
 )
 
 
@@ -21,9 +21,9 @@ load_dotenv()
 
 STEPS = ["Your profile", "Health context", "Food preferences", "Goal & duration", "Review"]
 DEFAULT_PROFILE = {
-    "age": 30, "sex": "Female", "height_cm": 165.0, "weight_kg": 65.0,
-    "activity": "Moderately active", "condition_status": "No", "conditions": [],
-    "other_condition": "", "health_notes": "", "medication_status": "No", "medications": [],
+    "age": None, "sex": "Prefer not to use this equation", "height_cm": None, "weight_kg": None,
+    "activity": None, "condition_status": None, "conditions": [],
+    "other_condition": "", "health_notes": "", "medication_status": None, "medications": [],
     "pregnant_or_breastfeeding": False, "specialist_care": False,
     "diet": "Omnivore", "allergies": [], "other_allergies": [], "restrictions": [],
     "avoid_foods": [], "diet_notes": "", "favourite_foods": "", "cuisine": "", "budget": "",
@@ -33,6 +33,7 @@ DEFAULT_STATE = {
     "page": "home", "wizard_step": 0, "draft": DEFAULT_PROFILE,
     "profile": None, "nutrition": None, "safety": None,
     "days": [], "history": [], "pending": None, "revision": 0, "pdf": None,
+    "attempted_steps": [], "touched_fields": [],
 }
 for state_key, default_value in DEFAULT_STATE.items():
     if state_key not in st.session_state:
@@ -50,7 +51,8 @@ st.markdown("""
     .stApp { background:var(--paper); color:var(--ink); }
     [data-testid="stHeader"] { background:var(--paper); color:var(--ink); }
     [data-testid="stSidebar"] { background:#eeefe9; border-right:1px solid var(--line); }
-    .block-container { max-width:1180px; padding:2rem 2rem 4rem; }
+    .block-container { max-width:1180px; padding:6rem 2rem 4rem; }
+    [data-testid="stMainBlockContainer"] { padding-top:6rem; }
     h1,h2,h3,h4,h5,h6 { color:var(--ink) !important; letter-spacing:-.025em; }
     [data-testid="stMarkdownContainer"], [data-testid="stText"],
     [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p,
@@ -157,7 +159,7 @@ st.markdown("""
     [data-testid="stAlertContentSuccess"] [data-testid="stMarkdownContainer"],
     [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) svg { color:var(--leaf-dark) !important; }
     hr { border-color:var(--line) !important; }
-    @media(max-width:760px) { .block-container {padding:1.2rem 1rem 3rem;} .hero {padding:1.3rem;} }
+    @media(max-width:760px) { .block-container {padding:5.5rem 1rem 3rem;} .hero {padding:1.3rem;} }
 </style>
 """, unsafe_allow_html=True)
 
@@ -171,6 +173,8 @@ def setting(name, fallback=""):
 
 
 def get_ai():
+    if st.session_state.profile and not st.session_state.profile["consent"]:
+        raise AIError("Kindly give consent to enable AI features. Your local report is already available without it.")
     return NutritionAI(setting("GROQ_API_KEY"), setting("GROQ_MODEL", "openai/gpt-oss-120b"))
 
 
@@ -185,27 +189,56 @@ def clear_session():
     st.rerun()
 
 
+def mark_touched(field):
+    if field not in st.session_state.touched_fields:
+        st.session_state.touched_fields.append(field)
+
+
+def show_field_error(field):
+    if field in st.session_state.touched_fields or st.session_state.wizard_step in st.session_state.attempted_steps:
+        message = profile_errors(st.session_state.draft).get(field)
+        if message:
+            st.error(message)
+
+
 def select_field(field, label, options):
     data = st.session_state.draft
-    data[field] = st.selectbox(label, list(options), index=list(options).index(data[field]), key=f"profile_{field}")
+    index = list(options).index(data[field]) if data.get(field) in options else None
+    data[field] = st.selectbox(label, list(options), index=index, placeholder="Select an option",
+                               key=f"profile_{field}", on_change=mark_touched, args=(field,))
+    show_field_error(field)
+
+
+def number_field(field, label, lower, upper):
+    data = st.session_state.draft
+    data[field] = st.number_input(label, min_value=lower, max_value=upper, value=data.get(field),
+                                  placeholder="Enter a value", key=f"profile_{field}",
+                                  on_change=mark_touched, args=(field,))
+    show_field_error(field)
 
 
 def text_field(field, label, help_text=None):
     data = st.session_state.draft
-    data[field] = st.text_area(label, value=data[field], max_chars=1000, help=help_text, key=f"profile_{field}")
+    data[field] = st.text_area(label, value=data[field], max_chars=1000, help=help_text, key=f"profile_{field}",
+                               on_change=mark_touched, args=(field,))
+    show_field_error(field)
 
 
 def list_field(field, label):
     data = st.session_state.draft
     value = st.text_area(label, value="\n".join(data[field]), max_chars=2000,
                          help="One ingredient or food per line; use English ingredient names. Do not enter sentences or 'none'.",
-                         key=f"profile_{field}")
+                         key=f"profile_{field}", on_change=mark_touched, args=(field,))
     data[field] = [item.strip() for item in value.replace(",", "\n").splitlines() if item.strip()]
+    show_field_error(field)
 
 
-def multi_field(field, label, options):
+def multi_field(field, label, options, show_error=True):
     data = st.session_state.draft
-    data[field] = st.multiselect(label, options, default=data[field], key=f"profile_{field}")
+    data[field] = st.multiselect(label, options, default=data[field], key=f"profile_{field}",
+                                 on_change=mark_touched, args=(field,))
+    if show_error:
+        show_field_error(field)
 
 
 def show_safety(safety):
@@ -213,7 +246,7 @@ def show_safety(safety):
     if safety["reasons"]:
         st.warning("\n\n".join(safety["reasons"]))
     if safety["blocked"]:
-        st.info("Personalized plan generation is paused. Bring your profile to a qualified professional; this app cannot provide medical nutrition therapy.")
+        st.info("Your general guidance report is available, including next steps and questions for your medical officer. It does not prescribe a treatment diet or calorie target.")
     st.caption(ALLERGY_NOTICE)
 
 
@@ -239,7 +272,7 @@ def show_home():
         with column:
             st.subheader(title)
             st.write(text)
-    st.info("Built for general adult nutrition support. Higher-risk profiles are referred for professional review rather than receiving an automated diet.")
+    st.info("Receive a nutrition guidance report even if you have a medical condition. Higher-risk reports focus on general support and professional consultation, not a prescribed diet.")
     if st.button("Build my nutrition plan", type="primary"):
         navigate("profile")
     if st.session_state.profile and st.button("Return to current plan"):
@@ -257,76 +290,81 @@ def show_profile():
     st.title("Tell us what works for you")
     st.progress((current + 1) / len(STEPS))
     st.caption(f"Step {current + 1} of {len(STEPS)} · {STEPS[current]}")
+    st.caption("* Required. Other fields are optional. You can choose Not sure for health or medication screening.")
     if current == 0:
         st.subheader("Your everyday profile")
         left, right = st.columns(2)
         with left:
-            data["age"] = st.number_input("Age (years)", 13, 100, int(data["age"]), key="profile_age")
-            select_field("sex", "Sex coefficient for the energy equation", ["Female", "Male", "Prefer not to use this equation"])
+            number_field("age", "Age (years) *", 13, 100)
+            select_field("sex", "Sex coefficient for the energy equation (optional)", ["Female", "Male", "Prefer not to use this equation"])
             st.caption("The original equation uses binary sex coefficients; this is not a question about gender identity. You can opt out of calorie estimates.")
         with right:
-            data["height_cm"] = st.number_input("Height (cm)", 120.0, 230.0, float(data["height_cm"]), step=0.5, key="profile_height")
-            data["weight_kg"] = st.number_input("Weight (kg)", 30.0, 300.0, float(data["weight_kg"]), step=0.5, key="profile_weight")
-        select_field("activity", "Usual activity level", ACTIVITY)
+            number_field("height_cm", "Height (cm) *", 120.0, 230.0)
+            number_field("weight_kg", "Weight (kg) *", 30.0, 300.0)
+        select_field("activity", "Usual activity level *", ACTIVITY)
         st.caption("Sedentary: little exercise · Light: 1–3 days/week · Moderate: 3–5 · Very active: 6–7 · Extra: highly physical work plus exercise. These categories are approximate.")
     elif current == 1:
         st.subheader("Health and medication context")
-        select_field("condition_status", "Do you have any medical condition that may affect your diet or nutritional needs?", SCREENING)
+        select_field("condition_status", "Do you have any medical condition that may affect your diet or nutritional needs? *", SCREENING)
         if data["condition_status"] == "Yes":
-            multi_field("conditions", "Conditions (select all that apply)", CONDITIONS)
-            text_field("other_condition", "Other condition or additional details")
+            multi_field("conditions", "Condition name * — select here or enter it below", CONDITIONS, show_error=False)
+            text_field("other_condition", "Other condition name (* if Other is selected; otherwise optional)")
+            show_field_error("conditions")
         else:
             data["conditions"], data["other_condition"] = [], ""
         data["pregnant_or_breastfeeding"] = st.checkbox("Pregnant or breastfeeding", value=data["pregnant_or_breastfeeding"], key="profile_pregnancy")
         data["specialist_care"] = st.checkbox("I need specialist nutrition care (for example, an eating disorder, severe malnutrition or complex diabetes management)", value=data["specialist_care"], key="profile_specialist")
         text_field("health_notes", "Other health information (optional)", "Any health notes suspend standard calorie targets pending professional advice.")
-        select_field("medication_status", "Are you taking medications that may be relevant to diet or nutrition?", SCREENING)
+        select_field("medication_status", "Are you taking medications that may be relevant to diet or nutrition? *", SCREENING)
         if data["medication_status"] == "Yes":
             count = st.number_input("Number of medications", 1, 10, max(1, len(data["medications"])), key="medication_count")
             existing = data["medications"]
-            medications = []
+            data["medications"] = [copy.deepcopy(existing[index]) if index < len(existing) else {"name": "", "dose": "", "frequency": ""} for index in range(count)]
             for index in range(count):
-                medication = existing[index] if index < len(existing) else {"name": "", "dose": "", "frequency": ""}
+                medication = data["medications"][index]
                 columns = st.columns(3)
-                record = {}
-                for column, field, label in zip(columns, ["name", "dose", "frequency"], ["Name", "Strength / dose (optional)", "Frequency (optional)"]):
-                    record[field] = column.text_input(f"Medication {index + 1}: {label}", value=medication[field], max_chars=120, key=f"medication_{index}_{field}")
-                medications.append(record)
-            data["medications"] = medications
+                for column, field, label in zip(columns, ["name", "dose", "frequency"], ["Name *", "Strength / dose (optional)", "Frequency (optional)"]):
+                    widget_key = f"medication_{index}_{field}"
+                    with column:
+                        medication[field] = st.text_input(f"Medication {index + 1}: {label}", value=medication[field], max_chars=120,
+                                                          key=widget_key, on_change=mark_touched, args=(widget_key,))
+                        show_field_error(widget_key)
         else:
             data["medications"] = []
         st.info("Medication details are dietary context only. The app cannot verify interactions or advise changes to medication. Ask your pharmacist.")
     elif current == 2:
         st.subheader("Food preferences and boundaries")
-        select_field("diet", "Dietary preference", DIETS)
-        multi_field("allergies", "Food allergies", list(ALLERGENS))
-        list_field("other_allergies", "Other food allergens")
-        multi_field("restrictions", "Dietary restrictions", RESTRICTIONS)
-        list_field("avoid_foods", "Foods you dislike or want to avoid")
+        st.caption("This step is optional. Add any known allergies or restrictions so they can be checked.")
+        select_field("diet", "Dietary preference (optional)", DIETS)
+        multi_field("allergies", "Food allergies (optional — add any known allergies)", list(ALLERGENS))
+        list_field("other_allergies", "Other food allergens (optional)")
+        multi_field("restrictions", "Dietary restrictions (optional)", RESTRICTIONS)
+        list_field("avoid_foods", "Foods you dislike or want to avoid (optional)")
         text_field("diet_notes", "Other dietary rules (optional)", "Complex free-text rules require professional review; structured restrictions and foods-to-avoid support automated checking.")
-        text_field("favourite_foods", "Favourite or available foods")
+        text_field("favourite_foods", "Favourite or available foods (optional)")
         text_field("cuisine", "Preferred cuisine or local food traditions (optional)")
         text_field("budget", "Budget and cooking constraints (optional)")
         st.caption(ALLERGY_NOTICE)
     elif current == 3:
         st.subheader("Your goal and planning horizon")
-        select_field("goal", "Primary nutrition goal", GOALS)
+        select_field("goal", "Primary nutrition goal *", GOALS)
         choices = [7, 14, 30, 60, 90, "Custom"]
         current_duration = data["duration"] if data["duration"] in choices else "Custom"
-        duration = st.selectbox("Plan duration", choices, index=choices.index(current_duration), format_func=lambda value: f"{value} days" if isinstance(value, int) else value, key="duration_choice")
+        duration = st.selectbox("Plan duration *", choices, index=choices.index(current_duration), format_func=lambda value: f"{value} days" if isinstance(value, int) else value, key="duration_choice")
         if duration == "Custom":
-            data["duration"] = st.number_input("Custom duration (days)", 1, 90, int(data["duration"]), key="custom_duration")
+            data["duration"] = st.number_input("Custom duration (days) *", 1, 90, data["duration"], key="custom_duration", on_change=mark_touched, args=("duration",))
+            show_field_error("duration")
         else:
             data["duration"] = duration
         st.caption("30 days is the recommended default. Custom plans are limited to 90 days per profile to bound API cost and response size. Long plans are generated in small, resumable batches.")
     else:
         st.subheader("Review before anything is sent")
-        st.write(f"{data['age']} years · {data['height_cm']:g} cm · {data['weight_kg']:g} kg · {data['activity']}")
+        st.write(f"{data['age']} years · {data['height_cm']} cm · {data['weight_kg']} kg · {data['activity']}")
         st.write(f"{data['goal']} · {data['diet']} · {data['duration']} days")
         with st.expander("Review all profile fields"):
             st.json({key: value for key, value in data.items() if key != "consent"})
         st.warning("Generating a new plan replaces the current plan and clears its chat and pending edits. Download the current plan first if you want to keep it.")
-        data["consent"] = st.checkbox("I understand this is general education and consent to sending my profile, health/medication context and relevant conversation to Groq when I use AI features.", value=data["consent"], key="profile_consent")
+        data["consent"] = st.checkbox("Optional: I consent to sending my profile, health/medication context and relevant conversation to Groq when I use AI features. A local guidance report does not require this consent.", value=data["consent"], key="profile_consent")
         try:
             reviewed = validate_profile({**data, "consent": True})
             safety = assess_safety(reviewed)
@@ -334,7 +372,7 @@ def show_profile():
             show_estimates(calculate_nutrition(reviewed, safety))
         except ValidationError as error:
             st.error(str(error))
-        if st.button("Save profile & open plan", type="primary", disabled=not data["consent"]):
+        if st.button("Create my report", type="primary"):
             try:
                 profile = validate_profile(data)
                 safety = assess_safety(profile)
@@ -342,7 +380,7 @@ def show_profile():
                                          "nutrition": calculate_nutrition(profile, safety),
                                          "days": [], "history": [], "pending": None,
                                          "revision": st.session_state.revision + 1, "pdf": None})
-                for key in ["view_day", "chat_day", "chat_slot", "export_profile"]:
+                for key in ["view_day", "chat_day", "chat_slot", "export_profile", "enable_ai_consent"]:
                     st.session_state.pop(key, None)
                 navigate("plan")
             except ValidationError as error:
@@ -355,7 +393,10 @@ def show_profile():
             st.rerun()
         navigate("home")
     if current < len(STEPS) - 1 and forward.button("Continue", type="primary", use_container_width=True):
-        st.session_state.wizard_step += 1
+        if current not in st.session_state.attempted_steps:
+            st.session_state.attempted_steps.append(current)
+        if not profile_errors(data, step=current):
+            st.session_state.wizard_step += 1
         st.rerun()
 
 
@@ -437,12 +478,14 @@ def show_pending():
 
 
 def show_downloads():
-    st.subheader("Take your plan with you")
-    st.caption("Exports include all generated days, current replacements, estimated totals and safety notes. Partial plans are labeled. Profile, health and medication details are excluded unless you opt in.")
+    st.subheader("Download your report")
+    st.caption("Your guidance report is ready even without generated meals or an API key. Downloads include general guidance, consultation questions, and any generated meals. Personal profile, health and medication details are excluded unless you opt in.")
     include_profile = st.checkbox("Include sensitive profile / health / medication details in exports", key="export_profile")
     document = export_document(st.session_state.profile, st.session_state.nutrition, st.session_state.safety, st.session_state.days, include_profile)
-    st.download_button("Download plan JSON", json.dumps(document, ensure_ascii=False, indent=2), "nutriguide-plan.json", "application/json")
-    st.download_button("Download meals CSV", export_csv(st.session_state.days), "nutriguide-meals.csv", "text/csv")
+    st.download_button("Download readable report (.txt)", export_text(document), "nutriguide-report.txt", "text/plain")
+    st.download_button("Download report JSON", json.dumps(document, ensure_ascii=False, indent=2), "nutriguide-report.json", "application/json")
+    if st.session_state.days:
+        st.download_button("Download meals CSV", export_csv(st.session_state.days), "nutriguide-meals.csv", "text/csv")
     if st.button("Prepare PDF report"):
         try:
             st.session_state.pdf = {"data": export_pdf(document), "revision": st.session_state.revision, "include_profile": include_profile}
@@ -453,6 +496,26 @@ def show_downloads():
         st.download_button("Download PDF report", cached["data"], "nutriguide-plan.pdf", "application/pdf")
 
 
+def show_guidance_report(profile, safety):
+    report = build_guidance_report(profile, safety)
+    st.success("Your nutrition guidance report is ready.")
+    st.write(report["summary"])
+    st.warning(report["consultation_note"])
+    with st.expander("General guidance and professional consultation checklist", expanded=safety["blocked"]):
+        for key, title in [("guidance", "General guidance"), ("questions_for_professional", "Questions for your medical officer"), ("next_steps", "Next steps")]:
+            st.subheader(title)
+            for item in report[key]:
+                st.write(f"• {item}")
+    with st.expander("Your reported health context (private to this session)"):
+        st.write("Medical condition screening: " + profile["condition_status"])
+        if profile["conditions"]:
+            st.write("Reported conditions: " + ", ".join(profile["conditions"]))
+        if profile["other_condition"]:
+            st.text(profile["other_condition"])
+        st.write("Medication screening: " + profile["medication_status"])
+        st.caption("This information is self-reported, not a diagnosis. Enable sensitive details in Downloads if you want them in your report.")
+
+
 def show_plan():
     if st.session_state.profile is None:
         st.info("Create a profile first.")
@@ -461,7 +524,7 @@ def show_plan():
         return
     profile = st.session_state.profile
     safety = st.session_state.safety
-    st.title(f"Your {profile['duration']}-day nutrition plan")
+    st.title("Your nutrition report" if safety["blocked"] else "Your nutrition report & meal plan")
     st.caption(f"{profile['goal']} · {profile['diet']} · {safety['status']}")
     if st.button("Edit profile"):
         for key in list(st.session_state):
@@ -469,25 +532,34 @@ def show_plan():
                 del st.session_state[key]
         st.session_state.draft = copy.deepcopy(profile)
         st.session_state.wizard_step = 0
+        st.session_state.attempted_steps = []
+        st.session_state.touched_fields = []
         st.session_state.pending = None
         navigate("profile")
     show_safety(safety)
     show_estimates(st.session_state.nutrition)
+    show_guidance_report(profile, safety)
     if safety["blocked"]:
-        with st.expander("Export profile for a professional consultation"):
-            show_downloads()
+        show_downloads()
         return
+    if not profile["consent"]:
+        st.info("Your local report is available without AI consent. Consent is needed only to send data to Groq for meal generation and chat.")
+        enable_ai = st.checkbox("I consent to sending my profile, health/medication context and relevant conversation to Groq for AI features.", key="enable_ai_consent")
+        if st.button("Enable AI features", disabled=not enable_ai):
+            st.session_state.profile = {**profile, "consent": True}
+            st.rerun()
     generated = len(st.session_state.days)
     st.progress(generated / profile["duration"])
     st.write(f"{generated} / {profile['duration']} days generated and validated" + (" · Complete" if generated == profile["duration"] else " · Partial plan"))
     if generated < profile["duration"]:
         st.caption("Each request generates at most two days. Completed batches are retained if a later request fails. Long plans can take several minutes and incur API charges; six-day chunks let you pause between requests.")
         left, right = st.columns(2)
-        if left.button("Generate next 6 days", type="primary", disabled=not setting("GROQ_API_KEY")):
+        if left.button("Generate next 6 days", type="primary", disabled=not setting("GROQ_API_KEY") or not profile["consent"]):
             generate_days(6)
-        if right.button("Generate / resume all remaining days", disabled=not setting("GROQ_API_KEY")):
+        if right.button("Generate / resume all remaining days", disabled=not setting("GROQ_API_KEY") or not profile["consent"]):
             generate_days()
     if not st.session_state.days:
+        show_downloads()
         return
     plan_tab, chat_tab, export_tab = st.tabs(["Daily meals", "Ask & refine", "Downloads"])
     with plan_tab:
@@ -511,9 +583,9 @@ def show_plan():
         show_pending()
         with st.form("meal_alternative"):
             instructions = st.text_input("Alternative / ingredient request", max_chars=1200, placeholder="I don't have oats; use another ingredient. Or: make this dinner cheaper.")
-            if st.form_submit_button("Suggest an alternative", disabled=not setting("GROQ_API_KEY")):
+            if st.form_submit_button("Suggest an alternative", disabled=not setting("GROQ_API_KEY") or not profile["consent"]):
                 request_edit(instructions or "Suggest a different meal with similar nutritional balance.", day_number, slot)
-        message = st.chat_input("Ask why this meal was chosen, or request a change", max_chars=1500, disabled=not setting("GROQ_API_KEY"))
+        message = st.chat_input("Ask why this meal was chosen, or request a change", max_chars=1500, disabled=not setting("GROQ_API_KEY") or not profile["consent"])
         if message:
             request_edit(message, day_number, slot)
     with export_tab:
@@ -532,7 +604,7 @@ with st.sidebar:
     if st.button("Clear session", disabled=not confirm_clear, use_container_width=True):
         clear_session()
 if not setting("GROQ_API_KEY"):
-    st.warning("AI is not configured. You can still review the app, enter a profile and calculate eligible estimates. Set GROQ_API_KEY in your environment or Streamlit secrets to generate meals and chat.")
+    st.info("Local guidance reports are available without an API key. Set GROQ_API_KEY in your environment or Streamlit secrets only to enable AI meal generation and chat.")
 
 if st.session_state.page == "profile":
     show_profile()

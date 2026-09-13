@@ -29,6 +29,10 @@ DISCLAIMER = (
     "Do not start, stop, or change medication based on this app. "
     "Consult a registered dietitian, physician, or pharmacist for individualized care."
 )
+CONSULTATION_NOTE = (
+    "Kindly consult a medical officer or registered dietitian for professional advice "
+    "before making dietary changes. Ask a pharmacist about food–medication interactions."
+)
 ALLERGY_NOTICE = (
     "Ingredient screening is not an allergy-safety guarantee. Check every ingredient, "
     "product label and preparation environment for allergens and cross-contact. "
@@ -90,9 +94,67 @@ def string_list(value, label, allowed=None):
     return list(dict.fromkeys(result))
 
 
-def validate_profile(raw):
+def profile_errors(raw, step=None, require_consent=False):
+    errors = {}
+    groups = {}
+
+    def check(field, group, validation):
+        groups[field] = group
+        try:
+            validation()
+        except ValidationError as error:
+            errors[field] = str(error)
+
+    for field, label, lower, upper, group in [
+        ("age", "age", 13, 100, 0), ("height_cm", "height in cm", 120, 230, 0),
+        ("weight_kg", "weight in kg", 30, 300, 0), ("duration", "plan duration", 1, 90, 3),
+    ]:
+        if raw.get(field) is None:
+            groups[field] = group
+            errors[field] = f"Kindly fill this field: {label}."
+        else:
+            check(field, group, lambda: number_value(raw[field], label, lower, upper, field in ["age", "duration"]))
+    for field, label, choices, group in [
+        ("sex", "an equation option", ["Female", "Male", "Prefer not to use this equation"], 0),
+        ("activity", "your activity level", ACTIVITY, 0), ("goal", "your goal", GOALS, 3),
+        ("diet", "a dietary preference", DIETS, 2),
+        ("condition_status", "Yes, No or Not sure", SCREENING, 1),
+        ("medication_status", "Yes, No or Not sure", SCREENING, 1),
+    ]:
+        groups[field] = group
+        if raw.get(field) not in list(choices):
+            errors[field] = f"Kindly select {label}."
+    if raw.get("condition_status") == "Yes":
+        if not raw.get("conditions") and not str(raw.get("other_condition", "")).strip():
+            groups["conditions"] = 1
+            errors["conditions"] = "Kindly select a condition or enter its name below. If unsure, choose Not sure."
+        if isinstance(raw.get("conditions"), list) and "Other" in raw["conditions"] and not str(raw.get("other_condition", "")).strip():
+            groups["other_condition"] = 1
+            errors["other_condition"] = "Kindly fill this field: other condition name."
+    medications = raw.get("medications", [])
+    if raw.get("medication_status") == "Yes" and isinstance(medications, list):
+        for index, medication in enumerate(medications or [{}]):
+            field = f"medication_{index}_name"
+            groups[field] = 1
+            if not isinstance(medication, dict) or not str(medication.get("name", "")).strip():
+                errors[field] = "Kindly fill this field: medication name. If unsure, choose Not sure."
+    for field, choices, group in [("conditions", CONDITIONS, 1), ("allergies", ALLERGENS, 2), ("restrictions", RESTRICTIONS, 2), ("other_allergies", None, 2), ("avoid_foods", None, 2)]:
+        check(field, group, lambda: string_list(raw.get(field, []), field, choices))
+    for field in ["other_condition", "health_notes", "diet_notes", "favourite_foods", "cuisine", "budget"]:
+        check(field, 1 if field in ["other_condition", "health_notes"] else 2,
+              lambda: text_value(raw.get(field, ""), field, optional=True))
+    if require_consent and raw.get("consent") is not True:
+        groups["consent"] = 4
+        errors["consent"] = "Kindly give your consent before using AI features. A local report does not need AI consent."
+    return {field: message for field, message in errors.items() if step is None or groups[field] == step}
+
+
+def validate_profile(raw, require_consent=False):
     if not isinstance(raw, dict):
         raise ValidationError("A profile is required.")
+    errors = profile_errors(raw, require_consent=require_consent)
+    if errors:
+        raise ValidationError(next(iter(errors.values())))
     profile = {}
     for key, lower, upper in [("age", 13, 100), ("height_cm", 120, 230), ("weight_kg", 30, 300), ("duration", 1, 90)]:
         profile[key] = number_value(raw.get(key), key, lower, upper, key in ["age", "duration"])
@@ -109,8 +171,6 @@ def validate_profile(raw):
         if type(raw.get(key)) is not bool:
             raise ValidationError(f"Please answer {key}.")
         profile[key] = raw[key]
-    if not profile["consent"]:
-        raise ValidationError("Consent is required before sending profile information to Groq.")
     for key, options in [("conditions", CONDITIONS), ("allergies", ALLERGENS), ("restrictions", RESTRICTIONS), ("other_allergies", None), ("avoid_foods", None)]:
         profile[key] = string_list(raw.get(key, []), key, options)
     for key in ["other_condition", "health_notes", "diet_notes", "favourite_foods", "cuisine", "budget"]:
@@ -148,7 +208,7 @@ def assess_safety(profile):
         reasons.append("Pregnancy, breastfeeding or specialist nutrition care requires an individualized professional assessment.")
         blocked = True
     if any(term in health for term in ["kidney", "renal", "liver", "eating disorder", "anorexi", "bulimi", "malnutrition", "pregnan", "breastfeed", "dialysis", "type 1", "type i diabetes"]):
-        reasons.append("Your reported health context requires professional review before an automated meal plan.")
+        reasons.append("Your report focuses on general guidance and questions for your care team; a treatment meal plan needs professional review.")
         blocked = True
     if bmi < 18.5 or bmi >= 40:
         reasons.append("These body measurements are outside this app's standard planning range; this is not a diagnosis.")
@@ -165,7 +225,35 @@ def assess_safety(profile):
     if profile["diet_notes"]:
         reasons.append("Free-text dietary rules need professional review before automated planning. Use structured restrictions or individual foods to avoid.")
         blocked = True
-    return {"blocked": blocked, "standard_calories": not reasons, "reasons": reasons, "status": "Professional review" if blocked else "Cautious guidance" if reasons else "Standard adult estimates"}
+    return {"blocked": blocked, "standard_calories": not reasons, "reasons": reasons, "status": "Guidance report with professional review" if blocked else "Cautious guidance" if reasons else "Standard adult estimates"}
+
+
+def build_guidance_report(profile, safety):
+    return {
+        "title": "Your nutrition guidance report",
+        "mode": "guidance_only" if safety["blocked"] else "guidance_and_optional_meals",
+        "summary": (
+            "This report provides general nutrition support and a checklist for a professional consultation. "
+            "It is not a diagnosis, treatment diet or prescription."
+        ),
+        "consultation_note": CONSULTATION_NOTE,
+        "guidance": [
+            "Use your existing clinician-provided nutrition instructions as the starting point; this report does not replace them.",
+            "Record your usual meals, food preferences, allergies and any difficulties with eating to discuss at your appointment.",
+            "Check ingredient labels and preparation methods against your allergies and dietary restrictions.",
+            "Avoid starting restrictive diets or supplements, and do not change medication based on this report.",
+        ],
+        "questions_for_professional": [
+            "Which foods and portions are appropriate for my conditions and current care plan?",
+            "Do I need individualized energy, protein, fluid or mineral guidance?",
+            "Could any of my medicines or supplements affect food choices or meal timing?",
+            "What changes should I monitor, and when should my nutrition plan be reviewed?",
+        ],
+        "next_steps": [
+            "Arrange a consultation with a medical officer or registered dietitian; take this report with you.",
+            "Bring your current medication list and any existing diet instructions. Include sensitive profile details in the download only if you want to share them.",
+        ],
+    }
 
 
 def calculate_nutrition(profile, safety):

@@ -33,13 +33,48 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 `GROQ_MODEL` is configurable; the default preserves the MVP's model selection,
 not a promise that the provider will keep offering it. Select a model that supports
 JSON object mode and `max_completion_tokens`. No API key is needed to open the
-application, review onboarding, or calculate eligible estimates. AI features are
+application, create a local guidance report, or calculate eligible estimates. AI features are
 disabled until configured. No API key is exposed in the UI.
 
 The app uses an ivory, white and forest-green light theme with explicit dark text
 and high-contrast controls. Matching `.streamlit/config.toml` files support launching
 from either the workspace root or `prism-uploads`. Restart Streamlit after changing
 theme configuration and refresh the browser to load the updated styles.
+
+The main content now starts below the fixed toolbar on desktop and mobile, so the
+NutriGuide name is no longer placed underneath the toolbar.
+
+### Required fields and disease reports
+
+- Required: age, height, weight, activity level, health/medication screening, goal
+  and duration. Numeric profile fields start empty rather than using invented
+  personal measurements. Goal and duration have editable defaults.
+- When screening is **Yes**, a condition name (selected or typed) or medication
+  name is required. **Not sure** is available when the user does not know.
+- Equation sex coefficient is optional (defaults to opting out of estimates).
+  Food preferences, allergies, restrictions, health notes, favourites, budget,
+  cuisine, and medication dose/frequency may be left blank. Users should still add
+  any known allergies so ingredient screening can use them.
+- Field-level messages such as “Kindly fill this field” appear after changing an
+  invalid field or trying Continue. The wizard stays on the relevant step until
+  its required entries are valid; optional blanks never prevent progression.
+- **Create my report** generates a local report without an API key or provider
+  consent. Every valid profile, including every disease selection, gets general
+  guidance, questions for a medical officer, next steps and downloadable TXT/JSON
+  (PDF when ReportLab is available). Higher-risk reports are complete guidance
+  reports, not rejected requests or empty partial meal plans. They do not prescribe
+  therapeutic menus or calorie targets. Other eligible profiles can also generate
+  optional AI meal ideas, subject to the existing constraints.
+- Every report states: “Kindly consult a medical officer or registered dietitian
+  for professional advice before making dietary changes.” Consultation is not
+  represented as a substitute for a real clinical assessment.
+- Provider consent is required only for AI requests, checked by both the UI and
+  AI adapter. It can be supplied on the review page or enabled later from the report.
+  No personal information is sent to Groq to create the local report.
+- TXT, JSON and PDF include the guidance sections even when there are no meals.
+  `report_complete` describes the local report; `complete` continues to describe
+  whether all requested meal-plan days exist. Sensitive profile details remain
+  opt-in. A meals CSV is available only after meals have been generated.
 
 No dependencies were installed, no virtual environment was created, and no live
 Groq calls were made in the editing workspace. Its Python environment does not
@@ -56,17 +91,18 @@ and a live smoke test in the deployment environment; they are not a verified loc
 | FR-09–10 | Python BMI, Mifflin–St Jeor resting energy, activity-adjusted maintenance, goal estimate and illustrative macros. Safety checks precede estimates. |
 | FR-11 | Actual numbered days, four meal slots, ingredients, portions, estimated calories and macros, explanations and calculated daily totals. |
 | FR-12–13 | Structured common allergies and dietary restrictions, other allergens, dislikes, dietary pattern and conservative alias matching on generated food content. |
-| FR-14–16, FR-21 | Deterministic caution/referral gates; medication context passed to the model; no interaction checker or medication decisions. Higher-risk profiles cannot generate plans. |
+| FR-14–16, FR-21 | Deterministic caution/referral gates; local guidance reports for all valid profiles, including diseases. Higher-risk reports provide consultation support instead of prescribed menus. No interaction checker or medication decisions. |
 | FR-17–20 | Contextual chat, on-demand meal/ingredient alternatives, preview/apply/discard, and revalidated updates to only the selected meal. Explanations accompany every meal. |
 | Reliability | Two-day generation requests, batch checkpoints, bounded retries, JSON/type/nutrient validation, sanitized errors, and no publication of a failing batch. |
 | Privacy | Explicit provider consent, session-only app state, no application database or health logs, clear-session control, sensitive export opt-in. |
-| Existing functionality | Streamlit/Groq stack, green visual styling and downloadable PDF retained; JSON and CSV downloads added. |
+| Existing functionality | Streamlit/Groq stack, green visual styling and downloadable PDF retained; readable TXT and JSON reports plus generated-meal CSV downloads added. |
 
 ### Workflow
 
 1. Complete the five-step wizard. Back/forward navigation retains draft answers.
-2. Review all data and the safety decision before saving. Saving a new profile
-   replaces the existing plan and clears chat/proposals; editing alone does not.
+2. Review all data and the safety decision, then choose Create my report. Saving
+   a new profile replaces the existing plan and clears chat/proposals; editing
+   alone does not. The local report is immediately readable and downloadable.
 3. Generate the next six days or all remaining days. Each request covers at most
    two days. One repair attempt is allowed for invalid AI output. API errors have
    at most three attempts with short backoff; each request has a 60-second timeout.
@@ -80,7 +116,8 @@ and a live smoke test in the deployment environment; they are not a verified loc
 7. Replacements are proposals, not automatic changes. **Apply** validates again,
    checks the plan revision, updates just that meal and recomputes daily totals.
    Discard leaves the plan untouched. A new request replaces any pending proposal.
-8. Download the current plan. JSON/PDF mark partial plans explicitly. CSV contains
+8. Download the current report and any generated meals. TXT/JSON/PDF distinguish
+   completed guidance reports from incomplete optional meal plans. CSV contains
    generated meal rows only (not a complete-plan manifest) and safety notes.
    PDF downloads are invalidated when the plan or sensitive-data selection changes.
 
@@ -91,7 +128,7 @@ and a live smoke test in the deployment environment; they are not a verified loc
   food constraints, schema checks, totals and immutable meal replacement.
 - `ai_service.py`: Groq adapter, fixed system policy, JSON requests, error handling,
   prompt context, batch validation and conversational proposals.
-- `exports.py`: independent JSON, CSV and optional ReportLab PDF serialization.
+- `exports.py`: independent TXT, JSON, CSV and optional ReportLab PDF serialization.
 - `.env.example`: secret-free configuration template.
 
 No new test suite or framework was added because the uploaded app had no tests.
@@ -108,7 +145,8 @@ validated nutrition protocol:
 - Age below 18, pregnancy/breastfeeding, declared specialist nutrition care,
   recognized high-risk health terms (including kidney/liver conditions), BMI outside
   the app's 18.5–<40 planning range, two or more listed medications, and unstructured
-  dietary rules pause automated planning for professional review. BMI is not used
+  dietary rules use guidance-only reports with professional consultation support
+  rather than automated therapeutic menus. BMI is not used
   to diagnose a condition. Input limits are 13–100 years, 120–230 cm, 30–300 kg.
 - Other reported conditions, any health notes, single medications and uncertain
   screening answers withhold calorie/BMI/macro targets. General meal ideas can still
@@ -171,8 +209,9 @@ schema or medical-safety validation; the local validators are still necessary.
 - PDF uses ReportLab's standard fonts; unsupported characters are replaced with
   `?` in the PDF rather than causing failure. JSON and CSV preserve Unicode.
 - There is no offline AI fallback or synthetic demo presented as a real plan.
-  With missing dependencies/key or unavailable models, configure the deployment;
-  do not expect live generation to work in this document-editing environment.
+  Local guidance reports are deterministic checklists, explicitly not AI-generated
+  diet plans. With missing dependencies/key or unavailable models, configure the
+  deployment; do not expect live AI generation to work in this editing environment.
 
 ## Validation performed
 
@@ -190,9 +229,18 @@ proposal rejection, plus checkpoint/resume after a simulated mid-plan failure.
 This checks Python control flow only; it does not verify real Streamlit widget
 lifecycle, browser layout, SDK compatibility or ReportLab output.
 
+The form/report update was checked with empty numeric fields, inline errors after
+Continue, correcting required values, missing conditional medication names, blank
+optional fields, custom duration, no-consent report creation, and disease reports
+for every listed condition. TXT/JSON privacy, calorie-target withholding and the
+no-consent/no-API-call guards were checked. Stubbed UI checks also covered report
+downloads without meals or a key. Header spacing was checked in the stylesheet;
+a real browser and PDF preview are still needed in the deployment environment.
+
 **Still required in an environment with the declared dependencies:**
 
-1. Launch without an API key; verify onboarding/eligible estimates remain available.
+1. Launch without an API key; verify onboarding, local reports and eligible estimates
+   remain available, and the full brand name clears the toolbar on mobile/desktop.
 2. Navigate back and forth through all wizard steps, including conditional medication
    rows and custom duration; verify retained values and profile regeneration.
 3. With a real key, generate a short plan and a 30-day plan; verify all requested days,

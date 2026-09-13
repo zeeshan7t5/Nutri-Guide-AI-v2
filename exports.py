@@ -7,14 +7,16 @@ import json
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape
 
-from nutrition import ALLERGY_NOTICE, DISCLAIMER, NUTRIENTS
+from nutrition import ALLERGY_NOTICE, DISCLAIMER, NUTRIENTS, build_guidance_report
 
 
 def export_document(profile, nutrition, safety, days, include_profile=False):
     result = {
-        "version": "2.0", "exported_at": datetime.now(timezone.utc).isoformat(),
+        "version": "2.1", "exported_at": datetime.now(timezone.utc).isoformat(),
         "requested_days": profile["duration"], "generated_days": len(days),
         "complete": len(days) == profile["duration"],
+        "report_complete": True,
+        "guidance_report": build_guidance_report(profile, safety),
         "disclaimer": DISCLAIMER, "allergy_notice": ALLERGY_NOTICE,
         "safety_status": safety["status"],
         "safety_note": "Professional review is required before using these meal ideas." if safety["reasons"] else "Estimates are not a prescription; review ingredients and portions before use.",
@@ -24,6 +26,31 @@ def export_document(profile, nutrition, safety, days, include_profile=False):
         result["profile"] = {key: copy.deepcopy(value) for key, value in profile.items() if key != "consent"}
         result["safety_reasons"] = list(safety["reasons"])
     return result
+
+
+def export_text(document):
+    report = document["guidance_report"]
+    lines = [report["title"], "Guidance report: complete", report["summary"],
+             report["consultation_note"], document["disclaimer"], document["allergy_notice"]]
+    if report["mode"] != "guidance_only":
+        lines.append(f"Optional meal plan: {document['generated_days']} of {document['requested_days']} days generated.")
+    else:
+        lines.append("This is a guidance report, not a prescribed multi-day meal plan.")
+    for key, title in [("guidance", "General guidance"), ("questions_for_professional", "Questions for your medical officer"), ("next_steps", "Next steps")]:
+        lines.extend(["", title, *[f"- {item}" for item in report[key]]])
+    if "profile" in document:
+        lines.extend(["", "Sensitive profile (included at your request)", json.dumps(document["profile"], ensure_ascii=False, indent=2)])
+        lines.extend(document.get("safety_reasons", []))
+    if document["nutrition_estimates"]["calories"] is not None:
+        lines.extend(["", "Nutrition estimates", json.dumps(document["nutrition_estimates"], indent=2)])
+    for day in document["days"]:
+        lines.extend(["", f"Day {day['day']}", f"Estimated totals: {day['totals']}"])
+        for meal in day["meals"]:
+            lines.append(f"{meal['slot'].title()}: {meal['name']} — {meal['portion']}")
+            lines.extend(f"  {item['name']}: {item['quantity']}" for item in meal["ingredients"])
+            lines.append("  Estimated nutrients: " + "; ".join(f"{key}: {meal[key]}" for key in NUTRIENTS))
+            lines.append(meal["explanation"])
+    return "\n".join(lines).encode("utf-8")
 
 
 def spreadsheet_text(value):
@@ -61,12 +88,23 @@ def export_pdf(document):
         story.append(Paragraph(escape(safe_text).replace("\n", "<br/>"), styles[style]))
         story.append(Spacer(1, 6))
 
-    paragraph("NutriGuide AI — Nutrition Plan", "Title")
-    status = "Complete" if document["complete"] else "PARTIAL PLAN"
-    paragraph(f"{status}: {document['generated_days']} of {document['requested_days']} days")
+    report = document["guidance_report"]
+    paragraph("NutriGuide AI — Nutrition Guidance Report", "Title")
+    paragraph("Guidance report: complete")
+    if report["mode"] != "guidance_only":
+        status = "Complete meal plan" if document["complete"] else "Optional meal plan (not yet complete)"
+        paragraph(f"{status}: {document['generated_days']} of {document['requested_days']} days")
+    else:
+        paragraph("General guidance and consultation checklist — not a prescribed multi-day meal plan.")
+    paragraph(report["summary"])
+    paragraph(report["consultation_note"])
     paragraph(document["disclaimer"])
     paragraph(document["allergy_notice"])
     paragraph(document["safety_note"])
+    for key, title in [("guidance", "General guidance"), ("questions_for_professional", "Questions for your medical officer"), ("next_steps", "Next steps")]:
+        paragraph(title, "Heading2")
+        for item in report[key]:
+            paragraph(item)
     estimates = document["nutrition_estimates"]
     if estimates["calories"] is not None:
         paragraph(f"Estimated BMI: {estimates['bmi']} | BMR: {estimates['bmr']} kcal/day | Maintenance: {estimates['tdee']} kcal/day | Goal: {estimates['calories']} kcal/day")

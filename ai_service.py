@@ -97,8 +97,10 @@ class NutritionAI:
                 "nutrition_estimates": nutrition, "safety": safety, "blocked_terms": blocked_terms(profile)}
 
     def generate_batch(self, profile, nutrition, safety, day_numbers, previous_days):
+        if profile.get("consent") is not True:
+            raise ValidationError("Kindly give consent before sending your profile to the AI service.")
         if safety["blocked"]:
-            raise ValidationError("Professional review is required before plan generation.")
+            raise ValidationError("Your guidance report is available locally. Use its consultation checklist for a professionally reviewed meal plan.")
         payload = self.context(profile, nutrition, safety)
         payload.update({"requested_days": list(day_numbers), "meal_schema": MEAL_SCHEMA,
                         "recent_meal_names": [meal["name"] for day in previous_days[-7:] for meal in day["meals"]]})
@@ -122,6 +124,8 @@ class NutritionAI:
         message = text_value(message, "Message", 1500)
         if safety["blocked"] or needs_professional_reply(message, profile):
             return {"answer": PROFESSIONAL_REPLY, "replacement": None}
+        if profile.get("consent") is not True:
+            raise ValidationError("Kindly give consent before sending your profile to the AI service.")
         day = next((day for day in days if day["day"] == day_number), None)
         if day is None:
             raise ValidationError("Select a generated day first.")
